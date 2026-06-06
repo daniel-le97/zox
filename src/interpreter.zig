@@ -2,6 +2,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const builtins = @import("builtins.zig");
 const runtime = @import("runtime.zig");
+const resolver = @import("resolver.zig");
 const stdlib = @import("stdlib.zig");
 const token = @import("token.zig");
 
@@ -59,6 +60,8 @@ pub fn runSourceWithPath(allocator: std.mem.Allocator, source: []const u8, sourc
     var parser = @import("parser.zig").Parser.init(allocator, tokens.items);
     const statements = try parser.parse();
 
+    try resolver.resolve(allocator, statements.items);
+
     var module_cache = ModuleCache{};
     var interpreter = try Interpreter.init(allocator, .{
         .io = io,
@@ -73,6 +76,8 @@ pub fn runSourceWithPath(allocator: std.mem.Allocator, source: []const u8, sourc
 }
 
 pub fn execute(allocator: std.mem.Allocator, statements: []const *ast.Stmt) !void {
+    try resolver.resolve(allocator, statements);
+
     var module_cache = ModuleCache{};
     var interpreter = try Interpreter.init(allocator, .{
         .io = null,
@@ -98,8 +103,7 @@ const Interpreter = struct {
     module_cache: *ModuleCache,
 
     fn init(allocator: std.mem.Allocator, context: ExecutionContext) !Interpreter {
-        const globals = try allocator.create(Environment);
-        globals.* = .{};
+        const globals = try Environment.init(allocator, null, true);
         var interpreter: Interpreter = .{
             .allocator = allocator,
             .globals = globals,
@@ -120,13 +124,15 @@ const Interpreter = struct {
     pub fn defineBuiltin(self: *Interpreter, name: []const u8, arity: ?usize, callback: runtime.BuiltinCallback) !void {
         const builtin = try self.allocator.create(BuiltinFunction);
         builtin.* = .{ .name = name, .arity = arity, .callback = callback };
-        try self.globals.define(self.allocator, name, .{ .native_function = @ptrCast(builtin) });
+        try self.globals.defineDynamic(self.allocator, name, .{ .native_function = @ptrCast(builtin) });
     }
 
     fn executeSource(self: *Interpreter, source: []const u8) !void {
         const tokens = try @import("scanner.zig").scanTokens(self.allocator, source);
         var parser = @import("parser.zig").Parser.init(self.allocator, tokens.items);
         const statements = try parser.parse();
+
+        try resolver.resolve(self.allocator, statements.items);
 
         for (statements.items) |statement| {
             try self.execute(statement);
@@ -147,7 +153,11 @@ const Interpreter = struct {
                     try self.evaluate(initializer)
                 else
                     .nil;
-                try self.environment.define(self.allocator, var_decl.name, value);
+                if (var_decl.slot) |_| {
+                    _ = try self.environment.defineSlot(self.allocator, var_decl.name, value);
+                } else {
+                    try self.environment.defineDynamic(self.allocator, var_decl.name, value);
+                }
             },
             .module_decl => |module_decl| {
                 self.module_name = module_decl.name;
@@ -156,7 +166,11 @@ const Interpreter = struct {
                 const module_value = try self.loadModule(import_stmt.path);
                 const module_object = asModule(module_value) orelse return error.InvalidOperand;
                 const binding_name = import_stmt.alias orelse module_object.name;
-                try self.environment.define(self.allocator, binding_name, module_value);
+                if (import_stmt.slot) |_| {
+                    _ = try self.environment.defineSlot(self.allocator, binding_name, module_value);
+                } else {
+                    try self.environment.defineDynamic(self.allocator, binding_name, module_value);
+                }
             },
             .function => |function_stmt| {
                 const function_object = try self.allocator.create(LoxFunction);
@@ -166,30 +180,46 @@ const Interpreter = struct {
                     .body = function_stmt.body,
                     .closure = self.environment,
                     .is_initializer = std.mem.eql(u8, function_stmt.name, "init"),
+                    .captures_environment = function_stmt.captures_environment,
                 };
-                try self.environment.define(self.allocator, function_stmt.name, .{ .function = @ptrCast(function_object) });
+                if (function_stmt.slot) |_| {
+                    _ = try self.environment.defineSlot(self.allocator, function_stmt.name, .{ .function = @ptrCast(function_object) });
+                } else {
+                    try self.environment.defineDynamic(self.allocator, function_stmt.name, .{ .function = @ptrCast(function_object) });
+                }
             },
             .class_decl => |class_decl| {
-                try self.environment.define(self.allocator, class_decl.name, .nil);
+                if (class_decl.slot) |_| {
+                    _ = try self.environment.defineSlot(self.allocator, class_decl.name, .nil);
+                } else {
+                    try self.environment.defineDynamic(self.allocator, class_decl.name, .nil);
+                }
 
                 var superclass: ?*LoxClass = null;
                 if (class_decl.superclass) |superclass_name| {
-                    const superclass_value = self.environment.get(superclass_name) orelse return error.UndefinedVariable;
+                    const superclass_value = if (class_decl.superclass_resolution) |resolution|
+                        self.environment.getAt(resolution.depth, resolution.slot) orelse return error.UndefinedVariable
+                    else
+                        self.environment.getDynamic(superclass_name) orelse return error.UndefinedVariable;
                     superclass = asClass(superclass_value) orelse return error.InvalidOperand;
                 }
 
                 var method_environment = self.environment;
                 if (superclass) |superclass_class| {
-                    const super_env = try self.allocator.create(Environment);
-                    super_env.* = .{ .enclosing = self.environment };
-                    try super_env.define(self.allocator, "super", .{ .class = @ptrCast(superclass_class) });
+                    const super_env = try Environment.init(self.allocator, self.environment, false);
+                    _ = try super_env.defineSlot(self.allocator, "super", .{ .class = @ptrCast(superclass_class) });
+                    try super_env.defineDynamic(self.allocator, "super", .{ .class = @ptrCast(superclass_class) });
                     method_environment = super_env;
                 }
 
                 const class_object = try self.allocator.create(LoxClass);
                 class_object.* = .{ .name = class_decl.name, .superclass = superclass };
                 try class_object.initMethods(self, method_environment, class_decl.methods);
-                try self.environment.define(self.allocator, class_decl.name, .{ .class = @ptrCast(class_object) });
+                if (class_decl.slot) |_| {
+                    _ = try self.environment.defineSlot(self.allocator, class_decl.name, .{ .class = @ptrCast(class_object) });
+                } else {
+                    try self.environment.defineDynamic(self.allocator, class_decl.name, .{ .class = @ptrCast(class_object) });
+                }
             },
             .return_stmt => |return_stmt| {
                 if (self.call_depth == 0) return error.InvalidReturn;
@@ -211,8 +241,7 @@ const Interpreter = struct {
                 try self.executeFor(for_stmt);
             },
             .block => |statements| {
-                const environment = try self.allocator.create(Environment);
-                environment.* = .{ .enclosing = self.environment };
+                const environment = try Environment.init(self.allocator, self.environment, false);
                 try self.executeBlock(statements, environment);
             },
             .if_stmt => |if_stmt| {
@@ -244,7 +273,7 @@ const Interpreter = struct {
             .unary => |unary| try self.evalUnary(unary),
             .binary => |binary| try self.evalBinary(binary),
             .logical => |logical| try self.evalLogical(logical),
-            .variable => |name| try self.getVariable(name),
+            .variable => |variable| try self.evalVariable(variable),
             .assign => |assignment| try self.evalAssign(assignment),
             .call => |call| try self.evalCall(call),
             .get => |get_expr| try self.evalGet(get_expr),
@@ -310,10 +339,10 @@ const Interpreter = struct {
     }
 
     fn evalSuper(self: *Interpreter, super_expr: ast.SuperExpr) RuntimeError!ast.LiteralValue {
-        const superclass_value = self.environment.get("super") orelse return error.UndefinedVariable;
+        const superclass_value = self.environment.getDynamic("super") orelse return error.UndefinedVariable;
         const superclass = asClass(superclass_value) orelse return error.InvalidOperand;
 
-        const object_value = self.environment.get("this") orelse return error.UndefinedVariable;
+        const object_value = self.environment.getDynamic("this") orelse return error.UndefinedVariable;
         const instance = asInstance(object_value) orelse return error.InvalidOperand;
 
         const method = superclass.getMethod(super_expr.method) orelse return error.UndefinedVariable;
@@ -394,6 +423,7 @@ const Interpreter = struct {
             .items = &[_]ast.LiteralValue{},
             .capacity = 0,
         };
+        defer arguments.deinit(self.allocator);
         for (call.arguments) |argument| {
             try arguments.append(self.allocator, try self.evaluate(argument));
         }
@@ -432,10 +462,15 @@ const Interpreter = struct {
     fn callFunction(self: *Interpreter, function_object: *LoxFunction, arguments: []const ast.LiteralValue) RuntimeError!ast.LiteralValue {
         if (function_object.params.len != arguments.len) return error.WrongArity;
 
-        const environment = try self.allocator.create(Environment);
-        environment.* = .{ .enclosing = function_object.closure };
+        const environment = try Environment.init(self.allocator, function_object.closure, false);
+        defer {
+            if (!function_object.captures_environment) {
+                environment.deinit(self.allocator);
+                self.allocator.destroy(environment);
+            }
+        }
         for (function_object.params, arguments) |param, argument| {
-            try environment.define(self.allocator, param, argument);
+            _ = try environment.defineSlot(self.allocator, param, argument);
         }
 
         const previous_return_value = self.return_value;
@@ -451,17 +486,25 @@ const Interpreter = struct {
             else => return err,
         };
 
-        if (function_object.is_initializer) return function_object.closure.getAt("this") orelse .nil;
+        if (function_object.is_initializer) return function_object.closure.getDynamic("this") orelse .nil;
         return self.return_value orelse .nil;
     }
 
-    fn getVariable(self: *Interpreter, name: []const u8) RuntimeError!ast.LiteralValue {
-        return self.environment.get(name) orelse error.UndefinedVariable;
+    fn evalVariable(self: *Interpreter, variable: ast.Variable) RuntimeError!ast.LiteralValue {
+        if (variable.resolved) |resolution| {
+            return self.environment.getAt(resolution.depth, resolution.slot) orelse error.UndefinedVariable;
+        }
+
+        return self.environment.getDynamic(variable.name) orelse error.UndefinedVariable;
     }
 
     fn evalAssign(self: *Interpreter, assignment: ast.Assign) RuntimeError!ast.LiteralValue {
         const assigned_value = try self.evaluate(assignment.value);
-        if (!try self.environment.assign(self.allocator, assignment.name, assigned_value)) {
+        if (assignment.resolved) |resolution| {
+            if (!try self.environment.assignAt(self.allocator, resolution.depth, resolution.slot, assigned_value)) {
+                return error.UndefinedVariable;
+            }
+        } else if (!try self.environment.assignDynamic(self.allocator, assignment.name, assigned_value)) {
             return error.UndefinedVariable;
         }
 
@@ -580,7 +623,13 @@ const LoxModule = struct {
 
     fn captureExports(self: *LoxModule, allocator: std.mem.Allocator, environment: *Environment) !void {
         self.exports = .{};
-        var iterator = environment.values.iterator();
+        if (environment.slot_names) |*slot_names| {
+            for (slot_names.items, environment.slots.items) |name, value| {
+                try self.exports.put(allocator, name, value);
+            }
+        }
+
+        var iterator = environment.bindings.iterator();
         while (iterator.next()) |entry| {
             try self.exports.put(allocator, entry.key_ptr.*, entry.value_ptr.*);
         }
@@ -597,11 +646,12 @@ const LoxFunction = struct {
     body: []const *ast.Stmt,
     closure: *Environment,
     is_initializer: bool = false,
+    captures_environment: bool = false,
 
     fn bind(self: *const LoxFunction, interpreter: *Interpreter, instance: *LoxInstance) RuntimeError!*LoxFunction {
-        const environment = try interpreter.allocator.create(Environment);
-        environment.* = .{ .enclosing = self.closure };
-        try environment.define(interpreter.allocator, "this", .{ .instance = @ptrCast(instance) });
+        const environment = try Environment.init(interpreter.allocator, self.closure, false);
+        _ = try environment.defineSlot(interpreter.allocator, "this", .{ .instance = @ptrCast(instance) });
+        try environment.defineDynamic(interpreter.allocator, "this", .{ .instance = @ptrCast(instance) });
 
         const bound = try interpreter.allocator.create(LoxFunction);
         bound.* = self.*;
@@ -626,6 +676,7 @@ const LoxClass = struct {
                         .body = function_stmt.body,
                         .closure = method_environment,
                         .is_initializer = std.mem.eql(u8, function_stmt.name, "init"),
+                        .captures_environment = function_stmt.captures_environment,
                     };
                     try self.methods.put(interpreter.allocator, function_stmt.name, function_object);
                 },
@@ -655,31 +706,84 @@ const LoxInstance = struct {
 };
 
 const Environment = struct {
-    values: std.StringHashMapUnmanaged(ast.LiteralValue) = .{},
+    slots: std.ArrayListUnmanaged(ast.LiteralValue) = .{ .items = &[_]ast.LiteralValue{}, .capacity = 0 },
+    slot_names: ?std.ArrayListUnmanaged([]const u8) = null,
+    bindings: std.StringHashMapUnmanaged(ast.LiteralValue) = .{},
     enclosing: ?*Environment = null,
 
-    fn define(self: *Environment, allocator: std.mem.Allocator, name: []const u8, defined_value: ast.LiteralValue) !void {
-        try self.values.put(allocator, name, defined_value);
+    fn init(allocator: std.mem.Allocator, enclosing: ?*Environment, track_names: bool) !*Environment {
+        const environment = try allocator.create(Environment);
+        environment.* = .{ .enclosing = enclosing };
+        if (track_names) {
+            environment.slot_names = .{ .items = &[_][]const u8{}, .capacity = 0 };
+        }
+        return environment;
     }
 
-    fn get(self: *Environment, name: []const u8) ?ast.LiteralValue {
-        if (self.values.get(name)) |stored_value| return stored_value;
-        if (self.enclosing) |enclosing| return enclosing.get(name);
+    fn deinit(self: *Environment, allocator: std.mem.Allocator) void {
+        self.slots.deinit(allocator);
+        self.bindings.deinit(allocator);
+        if (self.slot_names) |*names| {
+            names.deinit(allocator);
+        }
+    }
+
+    fn defineSlot(self: *Environment, allocator: std.mem.Allocator, name: []const u8, defined_value: ast.LiteralValue) !usize {
+        const slot = self.slots.items.len;
+        try self.slots.append(allocator, defined_value);
+        if (self.slot_names) |*names| {
+            try names.append(allocator, name);
+        }
+
+        return slot;
+    }
+
+    fn defineDynamic(self: *Environment, allocator: std.mem.Allocator, name: []const u8, defined_value: ast.LiteralValue) !void {
+        try self.bindings.put(allocator, name, defined_value);
+    }
+
+    fn getDynamic(self: *Environment, name: []const u8) ?ast.LiteralValue {
+        if (self.bindings.get(name)) |stored_value| return stored_value;
+        if (self.enclosing) |enclosing| return enclosing.getDynamic(name);
         return null;
     }
 
-    fn getAt(self: *Environment, name: []const u8) ?ast.LiteralValue {
-        return self.values.get(name);
+    fn getAt(self: *Environment, depth: usize, slot: usize) ?ast.LiteralValue {
+        var environment: *Environment = self;
+        var remaining_depth = depth;
+        while (remaining_depth > 0) {
+            environment = environment.enclosing orelse return null;
+            remaining_depth -= 1;
+        }
+
+        return if (slot < environment.slots.items.len) environment.slots.items[slot] else null;
     }
 
-    fn assign(self: *Environment, allocator: std.mem.Allocator, name: []const u8, assigned_value: ast.LiteralValue) !bool {
-        if (self.values.contains(name)) {
-            try self.values.put(allocator, name, assigned_value);
+    fn assignAt(self: *Environment, allocator: std.mem.Allocator, depth: usize, slot: usize, assigned_value: ast.LiteralValue) !bool {
+        var environment: *Environment = self;
+        var remaining_depth = depth;
+        while (remaining_depth > 0) {
+            environment = environment.enclosing orelse return false;
+            remaining_depth -= 1;
+        }
+
+        if (slot < environment.slots.items.len) {
+            environment.slots.items[slot] = assigned_value;
+            return true;
+        }
+
+        _ = allocator;
+        return false;
+    }
+
+    fn assignDynamic(self: *Environment, allocator: std.mem.Allocator, name: []const u8, assigned_value: ast.LiteralValue) !bool {
+        if (self.bindings.contains(name)) {
+            try self.bindings.put(allocator, name, assigned_value);
             return true;
         }
 
         if (self.enclosing) |enclosing| {
-            return try enclosing.assign(allocator, name, assigned_value);
+            return try enclosing.assignDynamic(allocator, name, assigned_value);
         }
 
         return false;

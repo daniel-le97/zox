@@ -8,12 +8,22 @@ pub const Expr = union(enum) {
     unary: Unary,
     binary: Binary,
     logical: Logical,
-    variable: []const u8,
+    variable: Variable,
     assign: Assign,
     call: Call,
     get: Get,
     set: Set,
     super_expr: SuperExpr,
+};
+
+pub const ResolvedLocal = struct {
+    depth: usize,
+    slot: usize,
+};
+
+pub const Variable = struct {
+    name: []const u8,
+    resolved: ?ResolvedLocal = null,
 };
 
 pub const Unary = struct {
@@ -36,6 +46,7 @@ pub const Logical = struct {
 pub const Assign = struct {
     name: []const u8,
     value: *Expr,
+    resolved: ?ResolvedLocal = null,
 };
 
 pub const Call = struct {
@@ -80,6 +91,7 @@ pub const Stmt = union(enum) {
 pub const VarDecl = struct {
     name: []const u8,
     initializer: ?*Expr,
+    slot: ?usize = null,
 };
 
 pub const ModuleDecl = struct {
@@ -89,6 +101,7 @@ pub const ModuleDecl = struct {
 pub const ImportStmt = struct {
     path: []const u8,
     alias: ?[]const u8,
+    slot: ?usize = null,
 };
 
 pub const IfStmt = struct {
@@ -113,6 +126,8 @@ pub const FunctionStmt = struct {
     name: []const u8,
     params: []const []const u8,
     body: []const *Stmt,
+    slot: ?usize = null,
+    captures_environment: bool = false,
 };
 
 pub const ReturnStmt = struct {
@@ -123,5 +138,7 @@ pub const ReturnStmt = struct {
 pub const ClassDecl = struct {
     name: []const u8,
     superclass: ?[]const u8,
+    superclass_resolution: ?ResolvedLocal = null,
     methods: []const *Stmt,
+    slot: ?usize = null,
 };

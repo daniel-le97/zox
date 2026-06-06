@@ -98,7 +98,7 @@ pub const Parser = struct {
             const value = try self.assignment();
 
             switch (expr.*) {
-                .variable => |name| return self.makeExpr(.{ .assign = .{ .name = name, .value = value } }),
+                .variable => |variable| return self.makeExpr(.{ .assign = .{ .name = variable.name, .value = value } }),
                 .get => |get_expr| return self.makeExpr(.{ .set = .{ .object = get_expr.object, .name = get_expr.name, .value = value } }),
                 else => {
                     self.errorAtToken(equals, "Invalid assignment target.");
@@ -230,7 +230,7 @@ pub const Parser = struct {
         if (self.match(.false_kw)) return self.makeExpr(.{ .literal = .{ .bool = false } });
         if (self.match(.true_kw)) return self.makeExpr(.{ .literal = .{ .bool = true } });
         if (self.match(.nil_kw)) return self.makeExpr(.{ .literal = .nil });
-        if (self.match(.this_kw)) return self.makeExpr(.{ .variable = "this" });
+        if (self.match(.this_kw)) return self.makeExpr(.{ .variable = .{ .name = "this" } });
 
         if (self.match(.super_kw)) {
             const keyword = self.previous();
@@ -245,7 +245,7 @@ pub const Parser = struct {
         }
 
         if (self.match(.identifier)) {
-            return self.makeExpr(.{ .variable = self.previous().lexeme });
+            return self.makeExpr(.{ .variable = .{ .name = self.previous().lexeme } });
         }
 
         if (self.match(.left_paren)) {
