@@ -6,6 +6,7 @@ pub const Value = union(enum) {
     number: f64,
     string: []const u8,
     function: *anyopaque,
+    native_function: *anyopaque,
     class: *anyopaque,
     instance: *anyopaque,
     module: *anyopaque,

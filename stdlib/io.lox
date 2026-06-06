@@ -1,0 +1,9 @@
+module io;
+
+fun readFile(path) {
+  return read_file(path);
+}
+
+fun writeFile(path, contents) {
+  return write_file(path, contents);
+}

@@ -1,8 +1,12 @@
 const std = @import("std");
 const ast = @import("ast.zig");
+const native_stdlib = @import("native_stdlib.zig");
+const runtime = @import("runtime.zig");
+const stdlib = @import("stdlib.zig");
 const token = @import("token.zig");
 
-pub const RuntimeError = error{ InvalidOperand, DivisionByZero, OutOfMemory, UndefinedVariable, NotCallable, WrongArity, InvalidReturn, ReturnSignal, BreakSignal, ContinueSignal, InvalidBreak, InvalidContinue, ImportUnavailable, ImportFailed, ImportCycle };
+pub const RuntimeError = runtime.RuntimeError;
+const BuiltinFunction = runtime.BuiltinFunction;
 
 const ModuleCache = struct {
     modules: std.StringHashMapUnmanaged(*LoxModule) = .{},
@@ -96,7 +100,7 @@ const Interpreter = struct {
     fn init(allocator: std.mem.Allocator, context: ExecutionContext) !Interpreter {
         const globals = try allocator.create(Environment);
         globals.* = .{};
-        return .{
+        var interpreter: Interpreter = .{
             .allocator = allocator,
             .globals = globals,
             .environment = globals,
@@ -105,6 +109,18 @@ const Interpreter = struct {
             .module_name = context.module_name,
             .module_cache = context.module_cache,
         };
+        try interpreter.installBuiltins();
+        return interpreter;
+    }
+
+    fn installBuiltins(self: *Interpreter) !void {
+        try native_stdlib.install(self);
+    }
+
+    fn defineBuiltin(self: *Interpreter, name: []const u8, arity: ?usize, callback: runtime.BuiltinCallback) !void {
+        const builtin = try self.allocator.create(BuiltinFunction);
+        builtin.* = .{ .name = name, .arity = arity, .callback = callback };
+        try self.globals.define(self.allocator, name, .{ .native_function = @ptrCast(builtin) });
     }
 
     fn executeSource(self: *Interpreter, source: []const u8) !void {
@@ -248,18 +264,27 @@ const Interpreter = struct {
         _ = try self.module_cache.beginLoad(self.allocator, resolved_path);
         defer self.module_cache.endLoad(self.allocator, resolved_path);
 
+        if (stdlib.getSource(resolved_path)) |source| {
+            return try self.instantiateModule(resolved_path, source);
+        }
+
         const cwd = std.Io.Dir.cwd();
         const stat = cwd.statFile(self.io.?, resolved_path, .{}) catch return error.ImportFailed;
         const source = try self.allocator.alloc(u8, @intCast(stat.size));
+        defer self.allocator.free(source);
 
         const read = cwd.readFile(self.io.?, resolved_path, source) catch return error.ImportFailed;
+        return try self.instantiateModule(resolved_path, read);
+    }
+
+    fn instantiateModule(self: *Interpreter, resolved_path: []const u8, source: []const u8) RuntimeError!ast.LiteralValue {
         var child = try Interpreter.init(self.allocator, .{
             .io = self.io,
             .source_path = resolved_path,
             .module_cache = self.module_cache,
             .module_name = defaultModuleName(resolved_path),
         });
-        child.executeSource(read) catch |err| switch (err) {
+        child.executeSource(source) catch |err| switch (err) {
             error.ImportCycle => return error.ImportCycle,
             else => return error.ImportFailed,
         };
@@ -272,6 +297,10 @@ const Interpreter = struct {
     }
 
     fn resolveImportPath(self: *Interpreter, import_path: []const u8) RuntimeError![]const u8 {
+        if (isStdlibPath(import_path)) {
+            return import_path;
+        }
+
         if (std.fs.path.isAbsolute(import_path)) {
             return import_path;
         }
@@ -371,10 +400,19 @@ const Interpreter = struct {
 
         return switch (callee) {
             .function => |function_object| try self.callFunction(@as(*LoxFunction, @ptrCast(@alignCast(function_object))), arguments.items),
+            .native_function => |function_object| try self.callBuiltin(@as(*BuiltinFunction, @ptrCast(@alignCast(function_object))), arguments.items),
             .class => |class_object| try self.instantiate(@as(*LoxClass, @ptrCast(@alignCast(class_object))), arguments.items),
             .module => error.NotCallable,
             else => error.NotCallable,
         };
+    }
+
+    fn callBuiltin(self: *Interpreter, builtin: *BuiltinFunction, arguments: []const ast.LiteralValue) RuntimeError!ast.LiteralValue {
+        if (builtin.arity) |arity| {
+            if (arity != arguments.len) return error.WrongArity;
+        }
+
+        return builtin.callback(.{ .allocator = self.allocator, .io = self.io }, arguments);
     }
 
     fn instantiate(self: *Interpreter, class_object: *LoxClass, arguments: []const ast.LiteralValue) RuntimeError!ast.LiteralValue {
@@ -523,6 +561,7 @@ const Interpreter = struct {
             .number => |n| std.debug.print("{d}\n", .{n}),
             .string => |s| std.debug.print("{s}\n", .{s}),
             .function => |function_object| std.debug.print("<fn {s}>\n", .{@as(*LoxFunction, @ptrCast(@alignCast(function_object))).name}),
+            .native_function => |function_object| std.debug.print("<builtin {s}>\n", .{@as(*BuiltinFunction, @ptrCast(@alignCast(function_object))).name}),
             .class => |class_object| std.debug.print("<class {s}>\n", .{@as(*LoxClass, @ptrCast(@alignCast(class_object))).name}),
             .instance => |instance_object| std.debug.print("<{s} instance>\n", .{@as(*LoxInstance, @ptrCast(@alignCast(instance_object))).class.name}),
             .module => |module_object| std.debug.print("<module {s}>\n", .{@as(*LoxModule, @ptrCast(@alignCast(module_object))).name}),
@@ -676,6 +715,10 @@ fn valuesEqual(left: ast.LiteralValue, right: ast.LiteralValue) bool {
             .function => |rhs| lhs == rhs,
             else => false,
         },
+        .native_function => |lhs| switch (right) {
+            .native_function => |rhs| lhs == rhs,
+            else => false,
+        },
         .class => |lhs| switch (right) {
             .class => |rhs| lhs == rhs,
             else => false,
@@ -715,6 +758,10 @@ fn asModule(value: ast.LiteralValue) ?*LoxModule {
 fn defaultModuleName(source_path: ?[]const u8) ?[]const u8 {
     const path = source_path orelse return null;
     return pathStem(path);
+}
+
+fn isStdlibPath(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, "std/");
 }
 
 fn pathStem(path: []const u8) []const u8 {
@@ -829,4 +876,43 @@ test "interpreter handles inheritance and super" {
     const statements = try parser.parse();
 
     try execute(arena.allocator(), statements.items);
+}
+
+test "interpreter loads embedded stdlib modules" {
+    const source = "import \"std/math.lox\"; print math.square(3); print math.answer;";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try runSource(arena.allocator(), source);
+}
+
+test "interpreter clock builtin returns a number" {
+    const source = "print clock() + 1;";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try runSource(arena.allocator(), source);
+}
+
+test "interpreter file io builtins read and write files" {
+    const io = std.testing.io_instance.io();
+    const temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+
+    try temp_dir.dir.writeFile(io, .{ .sub_path = "data.txt", .data = "seed" });
+    const data_path = try temp_dir.dir.realPathFileAlloc(io, "data.txt", std.testing.allocator);
+    defer std.testing.allocator.free(data_path);
+
+    const source = try std.fmt.allocPrint(std.testing.allocator,
+        \\import "std/io.lox";
+        \\io.writeFile("{s}", "hello from file io");
+        \\print io.readFile("{s}");
+    , .{ data_path, data_path });
+    defer std.testing.allocator.free(source);
+
+    try temp_dir.dir.writeFile(io, .{ .sub_path = "script.lox", .data = source });
+    const source_path = try temp_dir.dir.realPathFileAlloc(io, "script.lox", std.testing.allocator);
+    defer std.testing.allocator.free(source_path);
+
+    try runFile(io, std.testing.allocator, source_path);
 }
