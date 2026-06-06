@@ -1,12 +1,13 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const runtime = @import("runtime.zig");
+const builtin = @import("builtin");
 
 const Builtin = runtime.BuiltinFunction;
 
 pub fn install(host: anytype) !void {
-    inline for (builtins) |builtin| {
-        try host.defineBuiltin(builtin.name, builtin.arity, builtin.callback);
+    inline for (builtins) |entry| {
+        try host.defineBuiltin(entry.name, entry.arity, entry.callback);
     }
 }
 
@@ -19,7 +20,11 @@ const builtins = [_]Builtin{
 fn builtinClock(context: runtime.BuiltinContext, arguments: []const ast.LiteralValue) runtime.RuntimeError!ast.LiteralValue {
     _ = context;
     if (arguments.len != 0) return error.WrongArity;
-    return .{ .number = @as(f64, @floatFromInt(std.time.timestamp())) };
+    const seconds: i64 = switch (builtin.os.tag) {
+        .windows => @divTrunc(std.os.windows.ntdll.RtlGetSystemTimePrecise() - 116444736000000000, 10_000_000),
+        else => 0,
+    };
+    return .{ .number = @as(f64, @floatFromInt(seconds)) };
 }
 
 fn builtinReadFile(context: runtime.BuiltinContext, arguments: []const ast.LiteralValue) runtime.RuntimeError!ast.LiteralValue {

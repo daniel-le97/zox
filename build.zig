@@ -28,6 +28,8 @@ pub fn build(b: *std.Build) void {
     // to our consumers. We must give it a name because a Zig package can expose
     // multiple modules and consumers will need to be able to specify which
     // module they want to access.
+    const stdlib_generated = buildStdlibModule(b, target);
+
     const mod = b.addModule("zox", .{
         // The root source file is the "entry point" of this module. Users of
         // this module will only be able to access public declarations contained
@@ -40,6 +42,7 @@ pub fn build(b: *std.Build) void {
         // which requires us to specify a target.
         .target = target,
     });
+    mod.addImport("stdlib_generated", stdlib_generated);
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -155,6 +158,7 @@ pub fn build(b: *std.Build) void {
         "tests/inheritance.lox",
         "tests/logical.lox",
         "tests/imports.lox",
+        "tests/strings.lox",
     };
 
     for (fixtures) |fixture| {
@@ -175,4 +179,107 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+}
+
+const StdlibEntry = struct {
+    path: []const u8,
+    source: []const u8,
+};
+
+fn buildStdlibModule(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Module {
+    const allocator = b.allocator;
+    var entries: std.ArrayList(StdlibEntry) = .empty;
+    defer entries.deinit(allocator);
+
+    const cwd = std.Io.Dir.cwd();
+    var stdlib_dir = cwd.openDir(b.graph.io, "stdlib", .{ .iterate = true }) catch @panic("failed to open stdlib directory");
+    defer stdlib_dir.close(b.graph.io);
+
+    var walker = stdlib_dir.walk(allocator) catch @panic("failed to walk stdlib directory");
+    defer walker.deinit();
+
+    while (walker.next(b.graph.io) catch @panic("failed to enumerate stdlib directory")) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.basename, ".lox")) continue;
+
+        const source = entry.dir.readFileAlloc(b.graph.io, entry.basename, allocator, .unlimited) catch @panic("failed to read stdlib file");
+        const path = std.fmt.allocPrint(allocator, "std/{s}", .{entry.path}) catch @panic("failed to format stdlib path");
+        entries.append(allocator, .{ .path = path, .source = source }) catch @panic("failed to record stdlib file");
+    }
+
+    std.sort.insertion(StdlibEntry, entries.items, {}, struct {
+        fn lessThan(_: void, lhs: StdlibEntry, rhs: StdlibEntry) bool {
+            return std.mem.order(u8, lhs.path, rhs.path) == .lt;
+        }
+    }.lessThan);
+
+    const generated_source = buildStdlibSource(allocator, entries.items) catch @panic("failed to generate stdlib source");
+
+    const write_files = b.addWriteFiles();
+    const generated_path = write_files.add("stdlib_generated.zig", generated_source);
+    return b.createModule(.{
+        .root_source_file = generated_path,
+        .target = target,
+    });
+}
+
+fn buildStdlibSource(allocator: std.mem.Allocator, entries: []const StdlibEntry) ![]const u8 {
+    var buffer: std.ArrayList(u8) = .empty;
+    errdefer buffer.deinit(allocator);
+
+    try buffer.appendSlice(
+        allocator,
+        "const std = @import(\"std\");\n\n" ++
+            "pub const ModuleSource = struct {\n" ++
+            "    path: []const u8,\n" ++
+            "    source: []const u8,\n" ++
+            "};\n\n" ++
+            "pub const modules = [_]ModuleSource{\n",
+    );
+
+    for (entries) |entry| {
+        try buffer.appendSlice(allocator, "    .{ .path = ");
+        try appendZigStringLiteral(&buffer, allocator, entry.path);
+        try buffer.appendSlice(allocator, ", .source = ");
+        try appendZigStringLiteral(&buffer, allocator, entry.source);
+        try buffer.appendSlice(allocator, " },\n");
+    }
+
+    try buffer.appendSlice(
+        allocator,
+        "};\n\n" ++
+            "pub fn getSource(path: []const u8) ?[]const u8 {\n" ++
+            "    inline for (modules) |module| {\n" ++
+            "        if (std.mem.eql(u8, path, module.path)) {\n" ++
+            "            return module.source;\n" ++
+            "        }\n" ++
+            "    }\n\n" ++
+            "    return null;\n" ++
+            "}\n",
+    );
+
+    return buffer.toOwnedSlice(allocator);
+}
+
+fn appendZigStringLiteral(buffer: *std.ArrayList(u8), allocator: std.mem.Allocator, bytes: []const u8) !void {
+    try buffer.append(allocator, '"');
+    for (bytes) |byte| {
+        switch (byte) {
+            '"' => try buffer.appendSlice(allocator, "\\\""),
+            '\\' => try buffer.appendSlice(allocator, "\\\\"),
+            '\n' => try buffer.appendSlice(allocator, "\\n"),
+            '\r' => try buffer.appendSlice(allocator, "\\r"),
+            '\t' => try buffer.appendSlice(allocator, "\\t"),
+            0 => try buffer.appendSlice(allocator, "\\x00"),
+            else => if (byte < 0x20 or byte == 0x7f) {
+                try buffer.appendSlice(allocator, "\\x");
+                const digits = "0123456789ABCDEF";
+                try buffer.append(allocator, digits[byte >> 4]);
+                try buffer.append(allocator, digits[byte & 0x0f]);
+            } else {
+                try buffer.append(allocator, byte);
+            },
+        }
+    }
+    try buffer.append(allocator, '"');
 }

@@ -1,6 +1,6 @@
 const std = @import("std");
 const ast = @import("ast.zig");
-const native_stdlib = @import("native_stdlib.zig");
+const builtins = @import("builtins.zig");
 const runtime = @import("runtime.zig");
 const stdlib = @import("stdlib.zig");
 const token = @import("token.zig");
@@ -114,10 +114,10 @@ const Interpreter = struct {
     }
 
     fn installBuiltins(self: *Interpreter) !void {
-        try native_stdlib.install(self);
+        try builtins.install(self);
     }
 
-    fn defineBuiltin(self: *Interpreter, name: []const u8, arity: ?usize, callback: runtime.BuiltinCallback) !void {
+    pub fn defineBuiltin(self: *Interpreter, name: []const u8, arity: ?usize, callback: runtime.BuiltinCallback) !void {
         const builtin = try self.allocator.create(BuiltinFunction);
         builtin.* = .{ .name = name, .arity = arity, .callback = callback };
         try self.globals.define(self.allocator, name, .{ .native_function = @ptrCast(builtin) });
@@ -271,7 +271,7 @@ const Interpreter = struct {
         const cwd = std.Io.Dir.cwd();
         const stat = cwd.statFile(self.io.?, resolved_path, .{}) catch return error.ImportFailed;
         const source = try self.allocator.alloc(u8, @intCast(stat.size));
-        defer self.allocator.free(source);
+        errdefer self.allocator.free(source);
 
         const read = cwd.readFile(self.io.?, resolved_path, source) catch return error.ImportFailed;
         return try self.instantiateModule(resolved_path, read);
@@ -290,7 +290,7 @@ const Interpreter = struct {
         };
 
         const module_object = try self.allocator.create(LoxModule);
-        module_object.* = .{ .name = child.module_name orelse defaultModuleName(resolved_path) orelse resolved_path, .exports = .{} };
+        module_object.* = .{ .name = child.module_name orelse defaultModuleName(resolved_path) orelse resolved_path, .source = source, .exports = .{} };
         try module_object.captureExports(self.allocator, child.globals);
         try self.module_cache.put(self.allocator, resolved_path, module_object);
         return .{ .module = @ptrCast(module_object) };
@@ -571,6 +571,7 @@ const Interpreter = struct {
 
 const LoxModule = struct {
     name: []const u8,
+    source: []const u8,
     exports: std.StringHashMapUnmanaged(ast.LiteralValue) = .{},
 
     fn getField(self: *LoxModule, name: []const u8) ?ast.LiteralValue {
