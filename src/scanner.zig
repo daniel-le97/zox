@@ -170,8 +170,10 @@ fn isAlphaNumeric(c: u8) bool {
 fn keywordType(text: []const u8) ?token.TokenType {
     if (std.mem.eql(u8, text, "and")) return .and_kw;
     if (std.mem.eql(u8, text, "class")) return .class_kw;
+    if (std.mem.eql(u8, text, "break")) return .break_kw;
     if (std.mem.eql(u8, text, "else")) return .else_kw;
     if (std.mem.eql(u8, text, "false")) return .false_kw;
+    if (std.mem.eql(u8, text, "continue")) return .continue_kw;
     if (std.mem.eql(u8, text, "import")) return .import_kw;
     if (std.mem.eql(u8, text, "for")) return .for_kw;
     if (std.mem.eql(u8, text, "fun")) return .fun_kw;

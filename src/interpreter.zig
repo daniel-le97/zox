@@ -2,10 +2,11 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const token = @import("token.zig");
 
-pub const RuntimeError = error{ InvalidOperand, DivisionByZero, OutOfMemory, UndefinedVariable, NotCallable, WrongArity, InvalidReturn, ReturnSignal, ImportUnavailable, ImportFailed };
+pub const RuntimeError = error{ InvalidOperand, DivisionByZero, OutOfMemory, UndefinedVariable, NotCallable, WrongArity, InvalidReturn, ReturnSignal, BreakSignal, ContinueSignal, InvalidBreak, InvalidContinue, ImportUnavailable, ImportFailed, ImportCycle };
 
 const ModuleCache = struct {
     modules: std.StringHashMapUnmanaged(*LoxModule) = .{},
+    loading: std.StringHashMapUnmanaged(void) = .{},
 
     fn get(self: *ModuleCache, path: []const u8) ?*LoxModule {
         return self.modules.get(path);
@@ -13,6 +14,18 @@ const ModuleCache = struct {
 
     fn put(self: *ModuleCache, allocator: std.mem.Allocator, path: []const u8, module_object: *LoxModule) !void {
         try self.modules.put(allocator, path, module_object);
+    }
+
+    fn beginLoad(self: *ModuleCache, allocator: std.mem.Allocator, path: []const u8) !bool {
+        if (self.modules.contains(path)) return false;
+        if (self.loading.contains(path)) return error.ImportCycle;
+        try self.loading.put(allocator, path, {});
+        return true;
+    }
+
+    fn endLoad(self: *ModuleCache, allocator: std.mem.Allocator, path: []const u8) void {
+        _ = allocator;
+        _ = self.loading.remove(path);
     }
 };
 
@@ -73,6 +86,7 @@ const Interpreter = struct {
     globals: *Environment,
     environment: *Environment,
     call_depth: usize = 0,
+    active_loops: std.ArrayListUnmanaged(LoopContext) = .{ .items = &[_]LoopContext{}, .capacity = 0 },
     return_value: ?ast.LiteralValue = null,
     io: ?std.Io,
     source_path: ?[]const u8,
@@ -169,6 +183,17 @@ const Interpreter = struct {
                     .nil;
                 return error.ReturnSignal;
             },
+            .break_stmt => {
+                if (!self.canSignalLoop()) return error.InvalidBreak;
+                return error.BreakSignal;
+            },
+            .continue_stmt => {
+                if (!self.canSignalLoop()) return error.InvalidContinue;
+                return error.ContinueSignal;
+            },
+            .for_stmt => |for_stmt| {
+                try self.executeFor(for_stmt);
+            },
             .block => |statements| {
                 const environment = try self.allocator.create(Environment);
                 environment.* = .{ .enclosing = self.environment };
@@ -182,8 +207,15 @@ const Interpreter = struct {
                 }
             },
             .while_stmt => |while_stmt| {
+                try self.pushLoop();
+                defer self.popLoop();
+
                 while (isTruthy(try self.evaluate(while_stmt.condition))) {
-                    try self.execute(while_stmt.body);
+                    self.execute(while_stmt.body) catch |err| switch (err) {
+                        error.BreakSignal => break,
+                        error.ContinueSignal => continue,
+                        else => return err,
+                    };
                 }
             },
         }
@@ -213,9 +245,8 @@ const Interpreter = struct {
             return .{ .module = @ptrCast(cached_module) };
         }
 
-        const module_object = try self.allocator.create(LoxModule);
-        module_object.* = .{ .name = defaultModuleName(resolved_path) orelse resolved_path, .exports = .{} };
-        try self.module_cache.put(self.allocator, resolved_path, module_object);
+        _ = try self.module_cache.beginLoad(self.allocator, resolved_path);
+        defer self.module_cache.endLoad(self.allocator, resolved_path);
 
         const cwd = std.Io.Dir.cwd();
         const stat = cwd.statFile(self.io.?, resolved_path, .{}) catch return error.ImportFailed;
@@ -226,12 +257,17 @@ const Interpreter = struct {
             .io = self.io,
             .source_path = resolved_path,
             .module_cache = self.module_cache,
-            .module_name = module_object.name,
+            .module_name = defaultModuleName(resolved_path),
         });
-        child.executeSource(read) catch return error.ImportFailed;
+        child.executeSource(read) catch |err| switch (err) {
+            error.ImportCycle => return error.ImportCycle,
+            else => return error.ImportFailed,
+        };
 
-        module_object.name = child.module_name orelse module_object.name;
+        const module_object = try self.allocator.create(LoxModule);
+        module_object.* = .{ .name = child.module_name orelse defaultModuleName(resolved_path) orelse resolved_path, .exports = .{} };
         try module_object.captureExports(self.allocator, child.globals);
+        try self.module_cache.put(self.allocator, resolved_path, module_object);
         return .{ .module = @ptrCast(module_object) };
     }
 
@@ -271,6 +307,47 @@ const Interpreter = struct {
         }
 
         return error.UndefinedVariable;
+    }
+
+    fn executeFor(self: *Interpreter, for_stmt: ast.ForStmt) RuntimeError!void {
+        if (for_stmt.initializer) |initializer| {
+            try self.execute(initializer);
+        }
+
+        try self.pushLoop();
+        defer self.popLoop();
+
+        while (true) {
+            if (for_stmt.condition) |condition| {
+                if (!isTruthy(try self.evaluate(condition))) break;
+            }
+
+            var should_continue = false;
+            self.execute(for_stmt.body) catch |err| switch (err) {
+                error.BreakSignal => break,
+                error.ContinueSignal => should_continue = true,
+                else => return err,
+            };
+
+            if (for_stmt.increment) |increment| {
+                _ = try self.evaluate(increment);
+            }
+
+            if (should_continue) continue;
+        }
+    }
+
+    fn pushLoop(self: *Interpreter) RuntimeError!void {
+        try self.active_loops.append(self.allocator, .{ .call_depth = self.call_depth });
+    }
+
+    fn popLoop(self: *Interpreter) void {
+        self.active_loops.items.len -= 1;
+    }
+
+    fn canSignalLoop(self: *Interpreter) bool {
+        if (self.active_loops.items.len == 0) return false;
+        return self.active_loops.items[self.active_loops.items.len - 1].call_depth == self.call_depth;
     }
 
     fn evalSet(self: *Interpreter, set_expr: ast.Set) RuntimeError!ast.LiteralValue {
@@ -468,6 +545,10 @@ const LoxModule = struct {
             try self.exports.put(allocator, entry.key_ptr.*, entry.value_ptr.*);
         }
     }
+};
+
+const LoopContext = struct {
+    call_depth: usize,
 };
 
 const LoxFunction = struct {

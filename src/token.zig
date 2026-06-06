@@ -31,8 +31,10 @@ pub const TokenType = enum {
 
     and_kw,
     class_kw,
+    continue_kw,
     else_kw,
     false_kw,
+    break_kw,
     import_kw,
     fun_kw,
     for_kw,

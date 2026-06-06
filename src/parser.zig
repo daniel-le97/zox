@@ -63,6 +63,14 @@ pub const Parser = struct {
             return self.returnStatement();
         }
 
+        if (self.match(.break_kw)) {
+            return self.breakStatement();
+        }
+
+        if (self.match(.continue_kw)) {
+            return self.continueStatement();
+        }
+
         if (self.match(.left_brace)) {
             return self.blockStatement();
         }
@@ -380,35 +388,23 @@ pub const Parser = struct {
         }
         _ = try self.consume(.right_paren, "Expect ')' after for clauses.");
 
-        var body = try self.statement();
-
-        if (increment) |increment_expr| {
-            var statements: std.ArrayListUnmanaged(*ast.Stmt) = .{
-                .items = &[_]*ast.Stmt{},
-                .capacity = 0,
-            };
-            try statements.append(self.allocator, body);
-            try statements.append(self.allocator, try self.makeStmt(.{ .expression = increment_expr }));
-            body = try self.makeStmt(.{ .block = statements.items });
-        }
-
-        const while_condition = condition orelse try self.makeExpr(.{ .literal = .{ .bool = true } });
-        var while_stmt = try self.makeStmt(.{ .while_stmt = .{
-            .condition = while_condition,
+        const body = try self.statement();
+        return try self.makeStmt(.{ .for_stmt = .{
+            .initializer = initializer,
+            .condition = condition,
+            .increment = increment,
             .body = body,
         } });
+    }
 
-        if (initializer) |init_stmt| {
-            var statements: std.ArrayListUnmanaged(*ast.Stmt) = .{
-                .items = &[_]*ast.Stmt{},
-                .capacity = 0,
-            };
-            try statements.append(self.allocator, init_stmt);
-            try statements.append(self.allocator, while_stmt);
-            while_stmt = try self.makeStmt(.{ .block = statements.items });
-        }
+    fn breakStatement(self: *Parser) ParseError!*ast.Stmt {
+        _ = try self.consume(.semicolon, "Expect ';' after 'break'.");
+        return try self.makeStmt(.break_stmt);
+    }
 
-        return while_stmt;
+    fn continueStatement(self: *Parser) ParseError!*ast.Stmt {
+        _ = try self.consume(.semicolon, "Expect ';' after 'continue'.");
+        return try self.makeStmt(.continue_stmt);
     }
 
     fn ifStatement(self: *Parser) ParseError!*ast.Stmt {

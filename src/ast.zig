@@ -66,6 +66,9 @@ pub const Stmt = union(enum) {
     var_decl: VarDecl,
     module_decl: ModuleDecl,
     import_stmt: ImportStmt,
+    break_stmt,
+    continue_stmt,
+    for_stmt: ForStmt,
     function: FunctionStmt,
     return_stmt: ReturnStmt,
     class_decl: ClassDecl,
@@ -96,6 +99,13 @@ pub const IfStmt = struct {
 
 pub const WhileStmt = struct {
     condition: *Expr,
+    body: *Stmt,
+};
+
+pub const ForStmt = struct {
+    initializer: ?*Stmt,
+    condition: ?*Expr,
+    increment: ?*Expr,
     body: *Stmt,
 };
 

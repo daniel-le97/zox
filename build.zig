@@ -148,6 +148,7 @@ pub fn build(b: *std.Build) void {
         "tests/comparisons.lox",
         "tests/control_flow.lox",
         "tests/for_loop.lox",
+        "tests/loops.lox",
         "tests/scope.lox",
         "tests/functions.lox",
         "tests/classes.lox",
